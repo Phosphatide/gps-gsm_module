@@ -38,8 +38,9 @@ FONA. All due credit goes to the people at Adafruit.
 #define BUZZ_PIN 7
 #define GPSECHO  true
 
-char replybuffer[255];
+char replybuffer[161];
 bool beeping = false;
+bool fonaSetup = false;
 int8_t startSMS;
 
 // Default phone number to send texts to:
@@ -73,12 +74,11 @@ void useInterrupt(boolean v)
 
 void setup()  
 {
+  Serial.begin(115200);
+  
   /********
   GPS Setup
   ********/
-  // connect at 115200 so we can read the GPS fast enough and echo without dropping chars
-  Serial.begin(115200);
-  
   // 9600 NMEA is the default baud rate for Adafruit MTK GPS's- some use 4800
   GPS.begin(9600);
   
@@ -95,7 +95,7 @@ void setup()
   // print it out we don't suggest using anything higher than 1 Hz
 
   // Request updates on antenna status, comment out to keep quiet
-  GPS.sendCommand(PGCMD_ANTENNA);
+  // GPS.sendCommand(PGCMD_ANTENNA);
 
   // the nice thing about this code is you can have a timer0 interrupt go off
   // every 1 millisecond, and read data from the GPS for you. that makes the
@@ -108,12 +108,14 @@ void setup()
   ********/
    // initialize the buzzer pin as an output:
   pinMode(BUZZ_PIN, OUTPUT);
-  
-  
+}
+
+void setupFONA()
+{
   /********
   FONA Setup
   ********/
-  fonaSS.begin(4800);
+  fonaSS.begin(9600);
   
   // if FONA search fails, play an error buzzer
   if (!fona.begin(fonaSS)){
@@ -126,6 +128,7 @@ void setup()
     while(1);
   }
   startSMS = fona.getNumSMS();
+  fonaSetup = true;
   
   // if main setup goes well, play a jingle
   for(int i = 0; i < 4; i++){
@@ -148,10 +151,11 @@ SIGNAL(TIMER0_COMPA_vect) {
 #endif
 }
 
-uint32_t timer = millis();
+uint32_t gpsTimer = millis();
+uint32_t fonaTimer = gpsTimer;
 
 void loop() {
-  GPS.begin(9600);
+  gpsSS.listen();
   // in case you are not using the interrupt above, you'll
   // need to 'hand query' the GPS, not suggested :(
   if (! usingInterrupt) {
@@ -173,86 +177,123 @@ void loop() {
       return;  // we can fail to parse a sentence in which case we should just wait for another
   }
 
-  // if millis() or timer wraps around, we'll just reset it
-  if (timer > millis())  timer = millis();
+  // if millis() or a timer wraps around, we'll just reset it
+  if (gpsTimer > millis())  gpsTimer = millis();
+  if (fonaTimer > millis()) fonaTimer = millis();
   
+  Serial.print(millis() - gpsTimer);
+  Serial.println("/300000");
+  
+  char coordinates[30];
   Serial.println((int)GPS.fix);
   bool fix = GPS.fix;
-  char coordinates[141];
+  
+  // record the current coordinate location
   if (fix) {
-    String data = "UPDATE: ";
-    data += String(GPS.latitudeDegrees, 4) + ", ";
-    data += String(GPS.longitudeDegrees, 4) + ", ";
-    data += String(GPS.altitude);
+    // if this is the first time a fix is found, set up the FONA
+    // will not execute again afterward
+    if (!fonaSetup) setupFONA();
+    
+    String data;
+    float latitude = GPS.latitudeDegrees, longitude = GPS.longitudeDegrees, height = GPS.altitude;
+    char degree[12];
+    dtostrf(latitude, 2, 4, degree);
+    data += degree;
+    data += ", ";
+    dtostrf(longitude, 3, 4, degree);
+    data += degree;
+    data += ", ";
+    dtostrf(height, 2, 2, degree);
+    data += degree;
+    
     data.toCharArray(coordinates, data.length() + 1);
+    Serial.println(coordinates);
   }
   
-  fonaSS.begin(4800);
-  // if a new text message is received, analyze it for a command
-  int8_t smsnum = fona.getNumSMS();
-  Serial.println(smsnum);
-  if (smsnum > startSMS){
-    startSMS = fona.getNumSMS();
-    uint16_t smslen;
-    if (fona.readSMS(smsnum, replybuffer, 250, &smslen)){
-      char phoneNum[21];
-      if (fona.getSMSSender(smsnum, phoneNum, 21)){
-        String analyze = replybuffer;
-        analyze.toLowerCase();
-        
-        // replies with coordinates and altitude
-        if (analyze == "gps")
-        {
-          if (fix) {
-            fona.sendSMS(phoneNum, coordinates);
-          }
-          else{
-            char message[] = "NO GPS FIX";
-            fona.sendSMS(phoneNum, message);
+  // if the FONA is not ready yet, do not do any of the following
+  // must wait until a GPS fix is found before switching serial devices
+  if (fonaSetup){
+    // approximately every 2 seconds, check for new messages
+    if (millis() - fonaTimer > 2000){
+      fonaTimer = millis();
+      fonaSS.listen();
+      // if a new text message is received, analyze it for a command
+      int8_t smsnum = fona.getNumSMS();
+      Serial.println(smsnum);
+      if (smsnum > startSMS){
+        startSMS = fona.getNumSMS();
+        uint16_t smslen;
+        if (fona.readSMS(smsnum, replybuffer, 250, &smslen)){
+          char phoneNum[21];
+          if (fona.getSMSSender(smsnum, phoneNum, 21)){
+            String analyze = replybuffer;
+            analyze.toLowerCase();
+            Serial.println(analyze);
+            
+            // replies with coordinates and altitude
+            if (analyze == "gps")
+            {
+              if (fix) {
+                if (fona.sendSMS(phoneNum, coordinates)) {Serial.println("SMS sent");}
+                else {Serial.println("SMS failed");}
+              }
+              else{
+                char message[] = "ERROR: NO GPS FIX";
+                if(fona.sendSMS(phoneNum, message)) {Serial.println("SMS sent");}
+                else {Serial.println("SMS failed");}
+              }
+            }
+            
+            // toggles the alerting siren
+            else if(analyze == "beep")
+            {
+              if (beeping){
+                beeping = false;
+                char message[] = "BEEPING OFF";
+                if(fona.sendSMS(phoneNum, message)) {Serial.println("SMS sent");}
+                else {Serial.println("SMS failed");}
+              }
+              else{
+                beeping = true;
+                char message[] = "BEEPING ON";
+                if(fona.sendSMS(phoneNum, message)) {Serial.println("SMS sent");}
+                else {Serial.println("SMS failed");}
+              }
+            }
+            
+            // informs sender that a wrong command was sent
+            else
+            {
+              char message[] = "INVALID COMMAND";
+              if(fona.sendSMS(phoneNum, message)) {Serial.println("SMS sent");}
+              else {Serial.println("SMS failed");}
+            }
           }
         }
-        
-        // toggles the alerting siren
-        else if(analyze == "beep")
-        {
-          if (beeping){
-            beeping = false;
-            char message[] = "BEEPING OFF";
-            fona.sendSMS(phoneNum, message);
-          }
-          else{
-            beeping = true;
-            char message[] = "BEEPING ON";
-            fona.sendSMS(phoneNum, message);
-          }
-        }
-        
-        // informs sender that a wrong command was sent
-        else
-        {
-          char message[] = "INVALID COMMAND";
-          fona.sendSMS(phoneNum, message);
-        }
+      }
+    }
+    
+    // approximately every 5 minutes or so, send out the current location
+    if (millis() - gpsTimer > 300000) { 
+      gpsTimer = millis(); // reset the timer
+      fonaSS.listen();
+      if (fix) {
+        if (fona.sendSMS(sendto, coordinates)) {Serial.println("Update sent");}
+        else {Serial.println("Update failed");}
+      }
+      else{
+        char message[] = "WARNING: NO GPS FIX";
+        if (fona.sendSMS(sendto, message)) {Serial.println("Update sent");}
+        else {Serial.println("Update failed");}
       }
     }
   }
   
-  // approximately every 5 minutes or so, print out the current stats
-  if (millis() - timer > 300000) { 
-    timer = millis(); // reset the timer
-    if (fix) {
-      fona.sendSMS(sendto, coordinates);
-    }
-    else{
-      char message[] = "UPDATE: NO GPS FIX";
-      fona.sendSMS(sendto, message);
-    }
-  }
-  
-  if (beeping){    // play an alarm to help track down the module
+  // play an alarm to help track down the module
+  if (beeping){
     delay(1750);
     for(int i = 0; i < 4; i++){
-      tone(BUZZ_PIN, 440);
+      tone(BUZZ_PIN, 4200);
       if (i != 3) delay(100);
       else delay(250);
       noTone(BUZZ_PIN);
